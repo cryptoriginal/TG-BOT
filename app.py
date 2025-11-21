@@ -1,5 +1,4 @@
 import os
-import asyncio
 import json
 from datetime import datetime, timezone
 
@@ -7,27 +6,41 @@ import requests
 from google import genai
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
+    Updater,
     CommandHandler,
     MessageHandler,
-    filters,
+    Filters,
+    CallbackContext,
 )
 
 # ===============================
 # ENVIRONMENT VARIABLES
 # ===============================
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN missing (set it in Render env vars)")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY missing (set it in Render env vars)")
+
 GEMINI_MODEL = "gemini-2.5-flash"
 
+# ===============================
+# STRATEGY / SCANNER SETTINGS
+# ===============================
+
+# Auto scanner toggle (controlled by /start and /stop)
+SCAN_ENABLED = True
+
 # Scanner settings
-SCAN_INTERVAL_SECONDS = 300        # every 5 minutes
-MIN_VOLUME = 35_000_000            # min 24h quote volume in USDT
+SCAN_INTERVAL_SECONDS = 300          # every 5 minutes
+MIN_VOLUME = 50_000_000              # min 24h quote volume in USDT (changed to 50M)
 MAX_SCAN_SYMBOLS = 25
-MIN_PROBABILITY_FOR_TRADE = 65
+MIN_PROBABILITY_FOR_TRADE = 75       # min probability for upside/downside (changed to 75%)
+MIN_RR = 1.8                         # minimum risk:reward 1:1.8
 
 DEFAULT_TIMEFRAMES = [
     "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"
@@ -36,23 +49,19 @@ SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
 
 BINANCE_FAPI = "https://fapi.binance.com"
 
-# To avoid spamming same signal repeatedly
-last_signal_time: dict[tuple[str, str], datetime] = {}
+# avoid spamming identical signals
+last_signal_time = {}   # (symbol, direction) -> datetime
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN missing (set it in Render env vars)")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing (set it in Render env vars)")
-
+# Gemini client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ===============================
-# BINANCE API HELPERS
+# BINANCE HELPERS
 # ===============================
-def get_klines(symbol: str, interval: str, limit: int = 120):
-    """Fetch OHLCV from Binance USDT-M Futures."""
+
+def get_klines(symbol, interval, limit=120):
+    """Fetch OHLCV data from Binance USDT-M Futures."""
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
@@ -60,12 +69,13 @@ def get_klines(symbol: str, interval: str, limit: int = 120):
     return r.json()
 
 
-def get_top_symbols() -> list[str]:
-    """Get USDT-M futures symbols sorted by 24h quote volume and filtered by MIN_VOLUME."""
+def get_top_symbols():
+    """Return high-volume USDT-M futures symbols filtered by MIN_VOLUME."""
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     data = r.json()
+
     pairs = [
         s for s in data
         if s.get("symbol", "").endswith("USDT")
@@ -75,10 +85,10 @@ def get_top_symbols() -> list[str]:
     return [p["symbol"] for p in pairs[:MAX_SCAN_SYMBOLS]]
 
 
-def build_snapshot(symbol: str, timeframes: list[str]):
-    """Build OHLCV snapshot per timeframe + current price."""
-    snapshot: dict[str, list[dict]] = {}
-    current_price: float | None = None
+def build_snapshot(symbol, timeframes):
+    """Build OHLCV snapshot dict + current price for given timeframes."""
+    snapshot = {}
+    current_price = None
 
     for tf in timeframes:
         kl = get_klines(symbol, tf, 100)
@@ -104,7 +114,13 @@ def build_snapshot(symbol: str, timeframes: list[str]):
 # ===============================
 # GEMINI PROMPTS
 # ===============================
-def prompt_for_pair(symbol: str, timeframe: str | None, snapshot: dict, price: float) -> str:
+
+def prompt_for_pair(symbol, timeframe, snapshot, price):
+    """
+    Prompt for manual /pair analysis.
+    SL must be at a strong key level, using structure + fixed range volume profile logic,
+    and RR must be at least MIN_RR (1:1.8).
+    """
     return f"""
 You are an elite crypto futures analyst and trader.
 
@@ -115,6 +131,23 @@ Timeframe focus: {timeframe if timeframe else "Multi-timeframe"}
 OHLCV JSON:
 {json.dumps(snapshot)[:80000]}
 
+MAIN ANALYSIS RULES:
+- Base your view mainly on PRICE ACTION and MARKET STRUCTURE:
+  - Trend (uptrend / downtrend / range) on each timeframe.
+  - Important support/resistance zones.
+  - Trendlines, channels, breakouts, retests, bounces.
+  - Reversal candles (hammer, shooting star, engulfing, pin bars) at key levels.
+  - Chart patterns (triangles, flags, head & shoulders, double top/bottom, etc.).
+
+- Use "fixed range volume profile" in your reasoning:
+  - Identify high-volume nodes (HVN) and low-volume nodes (LVN) in this range.
+  - Stop loss must be placed around a logical structural invalidation level,
+    ideally just beyond a key HVN/LVN or clear swing high/low, NOT random
+    and NOT extremely tight.
+
+- Mentally also use EMAs (20, 50, 200), RSI, MACD, and volume as confirmation,
+  but price action + key levels are primary.
+
 TASK:
 1. Determine probabilities (0-100):
    - upside
@@ -123,16 +156,21 @@ TASK:
 
 2. Decide best_direction.
 
-3. If best_direction is upside/downside AND probability >= {MIN_PROBABILITY_FOR_TRADE}, generate:
+3. If best_direction is upside or downside AND its probability >= {MIN_PROBABILITY_FOR_TRADE},
+   generate a detailed trade plan:
    - direction (long/short)
-   - entry
-   - stop_loss
+   - entry (a single reasonable entry price)
+   - stop_loss (at a STRUCTURAL invalidation/key level as described above)
    - take_profit_1
    - take_profit_2
-   - rr_ratio
-   - leverage_hint
-   - confidence
-   - reasoning
+   - rr_ratio (approx risk:reward, must be >= {MIN_RR})
+   - leverage_hint (safe leverage range like 2x-5x)
+   - confidence (0-100)
+   - reasoning (short explanation referencing key levels, structure, volume profile zones)
+
+IMPORTANT:
+- Do NOT propose a trade if you cannot find a clean structure with rr_ratio >= {MIN_RR}.
+- If the conditions are not met, set direction="none" and leave rr_ratio at 0.
 
 Return ONLY valid JSON with this schema:
 
@@ -160,7 +198,12 @@ Return ONLY valid JSON with this schema:
 """
 
 
-def prompt_for_scan(symbol: str, snapshot: dict, price: float) -> str:
+def prompt_for_scan(symbol, snapshot, price):
+    """
+    Prompt for fast scanner.
+    Must only return trades with prob >= MIN_PROBABILITY_FOR_TRADE and RR >= MIN_RR.
+    SL should still be at strong structural / volume-profile level.
+    """
     return f"""
 Quick scan of crypto futures pair:
 
@@ -170,10 +213,31 @@ Price: {price}
 OHLCV JSON:
 {json.dumps(snapshot)[:60000]}
 
+RULES:
+- Use price action and structure (trend, key levels, breakouts, reversals).
+- Use a fixed range volume profile mental model to place STOP LOSS at a clear invalidation
+  zone beyond a key HVN/LVN or swing high/low, not random.
+- Only accept setups where risk:reward ratio is at least {MIN_RR} (1:{MIN_RR}).
+
 TASK:
-1. Determine probabilities (0-100) of upside/downside/flat.
+1. Determine probabilities (0-100) of:
+   - upside
+   - downside
+   - flat
+
 2. Decide best_direction.
-3. If best_direction is not flat and probability >= {MIN_PROBABILITY_FOR_TRADE}, produce a compact trade plan.
+
+3. If best_direction is upside or downside AND its probability >= {MIN_PROBABILITY_FOR_TRADE}
+   AND a clean trade with rr_ratio >= {MIN_RR} exists, produce a compact trade plan:
+   - direction
+   - entry
+   - stop_loss
+   - take_profit_1
+   - take_profit_2
+   - rr_ratio (>= {MIN_RR})
+   - confidence
+
+4. If conditions are not met, set direction="none".
 
 Return ONLY JSON:
 
@@ -191,6 +255,7 @@ Return ONLY JSON:
    "stop_loss": 0,
    "take_profit_1": 0,
    "take_profit_2": 0,
+   "rr_ratio": 0,
    "confidence": 0
  }}
 }}
@@ -200,19 +265,20 @@ Return ONLY JSON:
 # ===============================
 # GEMINI CALL + JSON PARSE
 # ===============================
-def call_gemini(prompt: str) -> str:
-    r = gemini_client.models.generate_content(
+
+def call_gemini(prompt):
+    resp = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
     )
-    return r.text
+    return resp.text
 
 
-def extract_json(text: str):
+def extract_json(text):
     try:
         start = text.index("{")
         end = text.rindex("}")
-        return json.loads(text[start : end + 1])
+        return json.loads(text[start:end + 1])
     except Exception:
         return None
 
@@ -220,12 +286,14 @@ def extract_json(text: str):
 # ===============================
 # ANALYSIS FUNCTIONS
 # ===============================
-def analyze_command(symbol: str, timeframe: str | None) -> str:
+
+def analyze_command(symbol, timeframe):
+    """Analysis for manual /pair and /pair timeframe commands."""
     tfs = [timeframe] if timeframe else DEFAULT_TIMEFRAMES
     snapshot, price = build_snapshot(symbol, tfs)
 
     if price is None:
-        return f"❌ Could not fetch data for *{symbol}* (wrong symbol or API issue)."
+        return f"❌ Could not fetch market data for *{symbol}*."
 
     prompt = prompt_for_pair(symbol, timeframe, snapshot, price)
     raw = call_gemini(prompt)
@@ -234,45 +302,58 @@ def analyze_command(symbol: str, timeframe: str | None) -> str:
     if not data:
         return "⚠️ Gemini JSON parse error. Raw response:\n\n" + raw[:3000]
 
-    p = data.get("probabilities", {})
-    tp = data.get("trade_plan", {})
+    probs = data.get("probabilities", {})
+    up = probs.get("upside", 0)
+    down = probs.get("downside", 0)
+    flat = probs.get("flat", 0)
     best = data.get("best_direction", "flat")
     view = data.get("overall_view", "")
 
-    up = p.get("upside", 0)
-    down = p.get("downside", 0)
-    flat = p.get("flat", 0)
+    tp = data.get("trade_plan", {}) or {}
+    direction = tp.get("direction", "none")
+    rr_ratio = float(tp.get("rr_ratio", 0) or 0.0)
 
-    msg_lines = []
+    # If RR is below threshold, treat as no valid setup
+    if rr_ratio < MIN_RR:
+        direction = "none"
+
     tf_label = timeframe if timeframe else "Multi-timeframe"
-    msg_lines.append(f"📊 *{symbol}* — *{tf_label}*")
-    msg_lines.append(f"Price: `{price}`\n")
-    msg_lines.append("*Probabilities:*")
-    msg_lines.append(f"⬆️ Upside: `{up}%`")
-    msg_lines.append(f"⬇️ Downside: `{down}%`")
-    msg_lines.append(f"➖ Flat: `{flat}%`")
-    msg_lines.append(f"🎯 Best direction: *{best.upper()}*\n")
+    lines = []
+    lines.append(f"📊 *{symbol}* — *{tf_label}*")
+    lines.append(f"Price: `{price}`\n")
+    lines.append("*Probabilities (next move):*")
+    lines.append(f"⬆️ Upside: `{up}%`")
+    lines.append(f"⬇️ Downside: `{down}%`")
+    lines.append(f"➖ Flat: `{flat}%`")
+    lines.append(f"🎯 Best direction: *{best.upper()}*\n")
+
     if view:
-        msg_lines.append(f"*View:* {view}\n")
+        lines.append(f"*View:* {view}\n")
 
-    if tp.get("direction", "none") != "none":
-        msg_lines.append("*🔥 Trade Setup:*")
-        msg_lines.append(f"Direction: *{tp['direction'].upper()}*")
-        msg_lines.append(f"Entry: `{tp['entry']}`")
-        msg_lines.append(f"SL: `{tp['stop_loss']}`")
-        msg_lines.append(f"TP1: `{tp['take_profit_1']}`")
-        msg_lines.append(f"TP2: `{tp['take_profit_2']}`")
-        msg_lines.append(f"RR: `{tp.get('rr_ratio', 0)}`")
-        msg_lines.append(f"Confidence: `{tp.get('confidence', 0)}%`")
-        msg_lines.append(f"Reason: {tp.get('reasoning', '')}")
+    if direction != "none":
+        lines.append("*🔥 Trade Setup (AI):*")
+        lines.append(f"Direction: *{direction.upper()}*")
+        lines.append(f"Entry: `{tp.get('entry', 0)}`")
+        lines.append(f"SL (key level): `{tp.get('stop_loss', 0)}`")
+        lines.append(f"TP1: `{tp.get('take_profit_1', 0)}`")
+        lines.append(f"TP2: `{tp.get('take_profit_2', 0)}`")
+        lines.append(f"RR: `{rr_ratio}`  (>= {MIN_RR})")
+        lines.append(f"Leverage: `{tp.get('leverage_hint', '')}`")
+        lines.append(f"Confidence: `{tp.get('confidence', 0)}%`")
+        if tp.get("reasoning"):
+            lines.append(f"Reason: {tp['reasoning']}")
     else:
-        msg_lines.append("🚫 No strong setup (probability < 65% or market too choppy).")
+        lines.append(
+            "🚫 No strong setup (probability < "
+            f"{MIN_PROBABILITY_FOR_TRADE}% or RR < {MIN_RR})."
+        )
 
-    msg_lines.append("\n_Not financial advice. Manage your own risk._")
-    return "\n".join(msg_lines)
+    lines.append("\n_Not financial advice. Manage your own risk._")
+    return "\n".join(lines)
 
 
-def analyze_scan(symbol: str):
+def analyze_scan(symbol):
+    """Return a compact signal dict for scanner, or None if no setup."""
     snapshot, price = build_snapshot(symbol, SCAN_TIMEFRAMES)
     if price is None:
         return None
@@ -284,19 +365,25 @@ def analyze_scan(symbol: str):
         return None
 
     probs = data.get("probabilities", {})
-    up = probs.get("upside", 0)
-    down = probs.get("downside", 0)
-    flat = probs.get("flat", 0)
+    up = float(probs.get("upside", 0) or 0.0)
+    down = float(probs.get("downside", 0) or 0.0)
+    flat = float(probs.get("flat", 0) or 0.0)
     best = data.get("best_direction", "flat")
 
-    tp = data.get("trade_plan", {})
+    tp = data.get("trade_plan", {}) or {}
     direction = tp.get("direction", "none")
+    rr_ratio = float(tp.get("rr_ratio", 0) or 0.0)
 
     if direction == "none" or best == "flat":
         return None
 
+    # Use upside or downside probability, ignore flat
     prob = up if best == "upside" else down
     if prob < MIN_PROBABILITY_FOR_TRADE:
+        return None
+
+    # Enforce RR threshold
+    if rr_ratio < MIN_RR:
         return None
 
     return {
@@ -307,6 +394,7 @@ def analyze_scan(symbol: str):
         "sl": tp.get("stop_loss", 0),
         "tp1": tp.get("take_profit_1", 0),
         "tp2": tp.get("take_profit_2", 0),
+        "rr": rr_ratio,
         "confidence": tp.get("confidence", prob),
     }
 
@@ -314,57 +402,98 @@ def analyze_scan(symbol: str):
 # ===============================
 # TELEGRAM HANDLERS
 # ===============================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+def start(update: Update, context: CallbackContext):
+    """Enable scanner and show help."""
+    global SCAN_ENABLED
+    SCAN_ENABLED = True
+
     text = (
         "🤖 *Gemini 2.5 Futures Bot*\n\n"
-        "Usage examples:\n"
-        "`/suiusdt` → Multi-timeframe AI analysis\n"
-        "`/suiusdt 4h` → 4h-focused AI analysis\n\n"
-        "Scanner runs every 5 minutes on high-volume Binance USDT-M futures "
-        "and sends high-probability setups directly to the owner."
+        "Scanner is now: *ON* ✅\n\n"
+        "Commands:\n"
+        "• `/coin` → Multi-timeframe AI analysis (e.g. `/suiusdt`)\n"
+        "• `/coin timeframe` → Single TF analysis (e.g. `/suiusdt 4h`)\n"
+        "• `/stop` → Stop auto scanner (manual analysis still works)\n"
+        "• `/start` → Turn auto scanner ON again\n\n"
+        f"Scanner rules:\n"
+        f"• Scans Binance USDT-M futures with 24h vol ≥ {MIN_VOLUME:,} USDT\n"
+        f"• Signals only if upside/downside prob ≥ {MIN_PROBABILITY_FOR_TRADE}%\n"
+        f"• Trade RR must be ≥ 1:{MIN_RR} and SL at key structural / volume-profile level."
     )
-    await update.message.reply_markdown(text)
+    update.message.reply_markdown(text)
 
 
-async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def stop(update: Update, context: CallbackContext):
+    """Disable scanner only; manual commands still work."""
+    global SCAN_ENABLED
+    SCAN_ENABLED = False
+    update.message.reply_text(
+        "⏹ Auto scanner is now *OFF*.\n\n"
+        "You can still use manual analysis like `/btcusdt` or `/ethusdt 4h`.\n"
+        "Send `/start` to turn auto scanner ON again."
+    )
+
+
+def handle_pair(update: Update, context: CallbackContext):
+    """Handle any /coin or /coin timeframe command."""
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
     parts = text.split()
 
-    cmd = parts[0].lstrip("/").upper()
+    symbol = parts[0].lstrip("/").upper()
     timeframe = parts[1].lower() if len(parts) > 1 else None
 
-    await update.message.reply_text(
-        f"⏳ Analysing {cmd}"
+    update.message.reply_text(
+        f"⏳ Analysing {symbol}"
         + (f" on {timeframe}" if timeframe else "")
         + " using Gemini 2.5..."
     )
 
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, analyze_command, cmd, timeframe)
+    try:
+        result = analyze_command(symbol, timeframe)
+    except Exception as e:
+        result = f"❌ Error while analysing {symbol}: {e}"
 
-    await update.message.reply_markdown(result)
+    update.message.reply_markdown(result)
 
 
 # ===============================
 # SCANNER JOB
 # ===============================
-async def scanner(context: ContextTypes.DEFAULT_TYPE):
+
+def scanner_job(context: CallbackContext):
+    """Runs every 5 minutes via JobQueue, if SCAN_ENABLED."""
     if OWNER_CHAT_ID == 0:
         return
 
-    loop = asyncio.get_running_loop()
-    symbols = await loop.run_in_executor(None, get_top_symbols)
+    # If user stopped scanner via /stop, do nothing
+    if not SCAN_ENABLED:
+        return
+
+    try:
+        symbols = get_top_symbols()
+    except Exception as e:
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"❌ Scanner: failed to fetch symbols: {e}",
+        )
+        return
+
+    now = datetime.now(timezone.utc)
 
     for sym in symbols:
-        sig = await loop.run_in_executor(None, analyze_scan, sym)
+        try:
+            sig = analyze_scan(sym)
+        except Exception:
+            continue
+
         if not sig:
             continue
 
-        key = (sym, sig["direction"])
-        now = datetime.now(timezone.utc)
+        key = (sig["symbol"], sig["direction"])
         last = last_signal_time.get(key)
         if last and (now - last).total_seconds() < 1800:  # 30 min cooldown
             continue
@@ -373,18 +502,19 @@ async def scanner(context: ContextTypes.DEFAULT_TYPE):
 
         msg = (
             "🚨 *AI Scanner Signal*\n"
-            f"Pair: *{sym}*\n"
+            f"Pair: *{sig['symbol']}*\n"
             f"Direction: *{sig['direction'].upper()}*\n"
             f"Probability: `{sig['probability']}%`\n"
+            f"RR: `{sig['rr']}` (>= {MIN_RR})\n"
             f"Entry: `{sig['entry']}`\n"
-            f"SL: `{sig['sl']}`\n"
+            f"SL (key level): `{sig['sl']}`\n"
             f"TP1: `{sig['tp1']}`\n"
             f"TP2: `{sig['tp2']}`\n"
             f"Confidence: `{sig['confidence']}%`\n\n"
             "_Use your own position sizing & risk control._"
         )
 
-        await context.bot.send_message(
+        context.bot.send_message(
             chat_id=OWNER_CHAT_ID,
             text=msg,
             parse_mode="Markdown",
@@ -394,30 +524,26 @@ async def scanner(context: ContextTypes.DEFAULT_TYPE):
 # ===============================
 # MAIN
 # ===============================
+
 def main():
-    # IMPORTANT: JobQueue works only if PTB installed with [job-queue] extra
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    # If job_queue is None, requirements not installed with [job-queue]
-    if app.job_queue is None:
-        raise RuntimeError(
-            "JobQueue is None. Install dependencies with "
-            '"python-telegram-bot[job-queue]" in requirements.txt'
-        )
+    # start/stop control scanner + help
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", start))
+    dp.add_handler(CommandHandler("stop", stop))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.COMMAND, handle_pair))
+    # catch all /pair commands like /suiusdt, /btcusdt 4h etc.
+    dp.add_handler(MessageHandler(Filters.command, handle_pair))
 
-    jq = app.job_queue
-    jq.run_repeating(scanner, interval=SCAN_INTERVAL_SECONDS, first=30)
+    # JobQueue is built-in in v13
+    jq = updater.job_queue
+    jq.run_repeating(scanner_job, interval=SCAN_INTERVAL_SECONDS, first=30)
 
-    print("✅ Bot running with polling + scanner...")
-    app.run_polling()
+    print("✅ Bot running with polling + scanner (PTB v13.15)...")
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":
