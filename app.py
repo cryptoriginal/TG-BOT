@@ -22,25 +22,27 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN missing (set it in Render env vars)")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing (set it in Render env vars)")
+    raise RuntimeError("GEMINI_API_KEY missing")
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # ===============================
-# STRATEGY / SCANNER SETTINGS
+# STRATEGY SETTINGS
 # ===============================
 
 # Auto scanner toggle (controlled by /start and /stop)
 SCAN_ENABLED = True
 
-# Scanner settings
-SCAN_INTERVAL_SECONDS = 300          # every 5 minutes
-MIN_VOLUME = 50_000_000              # min 24h quote volume in USDT (changed to 50M)
+# Scanner & filter settings
+SCAN_INTERVAL_SECONDS = 300       # 5 minutes
+MIN_VOLUME = 50_000_000           # 24h quote volume filter (>= 50M)
 MAX_SCAN_SYMBOLS = 25
-MIN_PROBABILITY_FOR_TRADE = 75       # min probability for upside/downside (changed to 75%)
-MIN_RR = 1.8                         # minimum risk:reward 1:1.8
+MIN_PROBABILITY_FOR_TRADE = 75    # min upside/downside probability (in %)
+
+# NEW: required RR for both manual and auto signals
+MIN_RR = 2.1                      # minimum RR 1 : 2.1
 
 DEFAULT_TIMEFRAMES = [
     "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"
@@ -49,8 +51,8 @@ SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
 
 BINANCE_FAPI = "https://fapi.binance.com"
 
-# avoid spamming identical signals
-last_signal_time = {}   # (symbol, direction) -> datetime
+# Throttle repeated signals
+last_signal_time = {}  # (symbol, direction) -> datetime
 
 # Gemini client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -118,8 +120,8 @@ def build_snapshot(symbol, timeframes):
 def prompt_for_pair(symbol, timeframe, snapshot, price):
     """
     Prompt for manual /pair analysis.
-    SL must be at a strong key level, using structure + fixed range volume profile logic,
-    and RR must be at least MIN_RR (1:1.8).
+    RR must be >= MIN_RR (2.1) and TP targets should be realistic in relation
+    to the upside/downside probability.
     """
     return f"""
 You are an elite crypto futures analyst and trader.
@@ -133,44 +135,51 @@ OHLCV JSON:
 
 MAIN ANALYSIS RULES:
 - Base your view mainly on PRICE ACTION and MARKET STRUCTURE:
-  - Trend (uptrend / downtrend / range) on each timeframe.
+  - Overall trend (uptrend / downtrend / range) on each timeframe.
   - Important support/resistance zones.
-  - Trendlines, channels, breakouts, retests, bounces.
+  - Trendlines and channels, breakouts or retests.
   - Reversal candles (hammer, shooting star, engulfing, pin bars) at key levels.
   - Chart patterns (triangles, flags, head & shoulders, double top/bottom, etc.).
 
-- Use "fixed range volume profile" in your reasoning:
-  - Identify high-volume nodes (HVN) and low-volume nodes (LVN) in this range.
-  - Stop loss must be placed around a logical structural invalidation level,
-    ideally just beyond a key HVN/LVN or clear swing high/low, NOT random
-    and NOT extremely tight.
+- Use a FIXED RANGE VOLUME PROFILE mental model:
+  - Identify high-volume nodes (HVN) and low-volume nodes (LVN) within this range.
+  - STOP LOSS must sit at a logical structural invalidation level:
+    just beyond a key HVN/LVN or clear swing high/low.
+  - SL must NOT be random and NOT extremely tight.
 
-- Mentally also use EMAs (20, 50, 200), RSI, MACD, and volume as confirmation,
-  but price action + key levels are primary.
+- Use EMAs (20, 50, 200), RSI, MACD and volume as confirmation only.
+
+- TAKE PROFIT LOGIC:
+  - RR (risk:reward) for the main idea must be at least {MIN_RR} (1:{MIN_RR}).
+  - TP1 should be a realistic, high-probability target consistent with the
+    upside/downside probability you give.
+  - TP2 can be more ambitious but still logically reachable based on structure,
+    trend and volume profile (not crazy far away).
 
 TASK:
-1. Determine probabilities (0-100):
+1. Determine probabilities (0-100) of the next meaningful move:
    - upside
    - downside
    - flat
 
 2. Decide best_direction.
 
-3. If best_direction is upside or downside AND its probability >= {MIN_PROBABILITY_FOR_TRADE},
-   generate a detailed trade plan:
+3. ONLY IF:
+   - best_direction is upside or downside, AND
+   - its probability >= {MIN_PROBABILITY_FOR_TRADE}, AND
+   - a clean setup with rr_ratio >= {MIN_RR} exists,
+   THEN generate a detailed trade plan:
    - direction (long/short)
-   - entry (a single reasonable entry price)
-   - stop_loss (at a STRUCTURAL invalidation/key level as described above)
-   - take_profit_1
-   - take_profit_2
-   - rr_ratio (approx risk:reward, must be >= {MIN_RR})
-   - leverage_hint (safe leverage range like 2x-5x)
+   - entry (single entry price)
+   - stop_loss (key level invalidation as above)
+   - take_profit_1 (realistic target matching the probability)
+   - take_profit_2 (more ambitious but still logical)
+   - rr_ratio (>= {MIN_RR})
+   - leverage_hint (safe range like 2x-4x)
    - confidence (0-100)
-   - reasoning (short explanation referencing key levels, structure, volume profile zones)
+   - reasoning (short explanation referencing structure & volume profile)
 
-IMPORTANT:
-- Do NOT propose a trade if you cannot find a clean structure with rr_ratio >= {MIN_RR}.
-- If the conditions are not met, set direction="none" and leave rr_ratio at 0.
+4. If conditions are NOT met, set direction="none" and rr_ratio=0.
 
 Return ONLY valid JSON with this schema:
 
@@ -201,8 +210,7 @@ Return ONLY valid JSON with this schema:
 def prompt_for_scan(symbol, snapshot, price):
     """
     Prompt for fast scanner.
-    Must only return trades with prob >= MIN_PROBABILITY_FOR_TRADE and RR >= MIN_RR.
-    SL should still be at strong structural / volume-profile level.
+    RR must be >= MIN_RR and probability >= MIN_PROBABILITY_FOR_TRADE.
     """
     return f"""
 Quick scan of crypto futures pair:
@@ -214,30 +222,16 @@ OHLCV JSON:
 {json.dumps(snapshot)[:60000]}
 
 RULES:
-- Use price action and structure (trend, key levels, breakouts, reversals).
-- Use a fixed range volume profile mental model to place STOP LOSS at a clear invalidation
-  zone beyond a key HVN/LVN or swing high/low, not random.
-- Only accept setups where risk:reward ratio is at least {MIN_RR} (1:{MIN_RR}).
+- Use price action + structure (trend, key levels, breakouts, reversals).
+- Use a fixed range volume profile mental model for SL positioning at a
+  structural invalidation level (beyond key HVN/LVN or swing high/low).
+- Only accept setups where:
+  - best_direction is upside or downside,
+  - the probability of that move >= {MIN_PROBABILITY_FOR_TRADE}%, and
+  - risk:reward rr_ratio >= {MIN_RR} (1:{MIN_RR} or better).
 
-TASK:
-1. Determine probabilities (0-100) of:
-   - upside
-   - downside
-   - flat
-
-2. Decide best_direction.
-
-3. If best_direction is upside or downside AND its probability >= {MIN_PROBABILITY_FOR_TRADE}
-   AND a clean trade with rr_ratio >= {MIN_RR} exists, produce a compact trade plan:
-   - direction
-   - entry
-   - stop_loss
-   - take_profit_1
-   - take_profit_2
-   - rr_ratio (>= {MIN_RR})
-   - confidence
-
-4. If conditions are not met, set direction="none".
+- TP1 must be a realistic, high-probability target consistent with the
+  given move probability. TP2 can be more ambitious but still logical.
 
 Return ONLY JSON:
 
@@ -266,7 +260,7 @@ Return ONLY JSON:
 # GEMINI CALL + JSON PARSE
 # ===============================
 
-def call_gemini(prompt):
+def call_gemini(prompt: str) -> str:
     resp = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
@@ -274,7 +268,7 @@ def call_gemini(prompt):
     return resp.text
 
 
-def extract_json(text):
+def extract_json(text: str):
     try:
         start = text.index("{")
         end = text.rindex("}")
@@ -287,7 +281,7 @@ def extract_json(text):
 # ANALYSIS FUNCTIONS
 # ===============================
 
-def analyze_command(symbol, timeframe):
+def analyze_command(symbol: str, timeframe: str | None):
     """Analysis for manual /pair and /pair timeframe commands."""
     tfs = [timeframe] if timeframe else DEFAULT_TIMEFRAMES
     snapshot, price = build_snapshot(symbol, tfs)
@@ -300,7 +294,7 @@ def analyze_command(symbol, timeframe):
     data = extract_json(raw)
 
     if not data:
-        return "⚠️ Gemini JSON parse error. Raw response:\n\n" + raw[:3000]
+        return "⚠️ Gemini JSON parse error. Raw:\n\n" + raw[:2500]
 
     probs = data.get("probabilities", {})
     up = probs.get("upside", 0)
@@ -313,11 +307,12 @@ def analyze_command(symbol, timeframe):
     direction = tp.get("direction", "none")
     rr_ratio = float(tp.get("rr_ratio", 0) or 0.0)
 
-    # If RR is below threshold, treat as no valid setup
+    # Enforce RR threshold for manual analysis too
     if rr_ratio < MIN_RR:
         direction = "none"
 
     tf_label = timeframe if timeframe else "Multi-timeframe"
+
     lines = []
     lines.append(f"📊 *{symbol}* — *{tf_label}*")
     lines.append(f"Price: `{price}`\n")
@@ -337,22 +332,22 @@ def analyze_command(symbol, timeframe):
         lines.append(f"SL (key level): `{tp.get('stop_loss', 0)}`")
         lines.append(f"TP1: `{tp.get('take_profit_1', 0)}`")
         lines.append(f"TP2: `{tp.get('take_profit_2', 0)}`")
-        lines.append(f"RR: `{rr_ratio}`  (>= {MIN_RR})")
+        lines.append(f"RR: `{rr_ratio}` (≥ {MIN_RR})")
         lines.append(f"Leverage: `{tp.get('leverage_hint', '')}`")
         lines.append(f"Confidence: `{tp.get('confidence', 0)}%`")
         if tp.get("reasoning"):
             lines.append(f"Reason: {tp['reasoning']}")
     else:
         lines.append(
-            "🚫 No strong setup (probability < "
-            f"{MIN_PROBABILITY_FOR_TRADE}% or RR < {MIN_RR})."
+            f"🚫 No strong setup (probability < {MIN_PROBABILITY_FOR_TRADE}% "
+            f"or RR < {MIN_RR})."
         )
 
     lines.append("\n_Not financial advice. Manage your own risk._")
     return "\n".join(lines)
 
 
-def analyze_scan(symbol):
+def analyze_scan(symbol: str):
     """Return a compact signal dict for scanner, or None if no setup."""
     snapshot, price = build_snapshot(symbol, SCAN_TIMEFRAMES)
     if price is None:
@@ -367,7 +362,7 @@ def analyze_scan(symbol):
     probs = data.get("probabilities", {})
     up = float(probs.get("upside", 0) or 0.0)
     down = float(probs.get("downside", 0) or 0.0)
-    flat = float(probs.get("flat", 0) or 0.0)
+    flat = float(probs.get("flat", 0) or 0.0)  # not directly used
     best = data.get("best_direction", "flat")
 
     tp = data.get("trade_plan", {}) or {}
@@ -377,12 +372,9 @@ def analyze_scan(symbol):
     if direction == "none" or best == "flat":
         return None
 
-    # Use upside or downside probability, ignore flat
     prob = up if best == "upside" else down
     if prob < MIN_PROBABILITY_FOR_TRADE:
         return None
-
-    # Enforce RR threshold
     if rr_ratio < MIN_RR:
         return None
 
@@ -404,7 +396,7 @@ def analyze_scan(symbol):
 # ===============================
 
 def start(update: Update, context: CallbackContext):
-    """Enable scanner and show help."""
+    """Enable scanner and show basic help."""
     global SCAN_ENABLED
     SCAN_ENABLED = True
 
@@ -416,10 +408,10 @@ def start(update: Update, context: CallbackContext):
         "• `/coin timeframe` → Single TF analysis (e.g. `/suiusdt 4h`)\n"
         "• `/stop` → Stop auto scanner (manual analysis still works)\n"
         "• `/start` → Turn auto scanner ON again\n\n"
-        f"Scanner rules:\n"
+        "Scanner rules:\n"
         f"• Scans Binance USDT-M futures with 24h vol ≥ {MIN_VOLUME:,} USDT\n"
         f"• Signals only if upside/downside prob ≥ {MIN_PROBABILITY_FOR_TRADE}%\n"
-        f"• Trade RR must be ≥ 1:{MIN_RR} and SL at key structural / volume-profile level."
+        f"• Trade RR must be ≥ 1:{MIN_RR} and SL at strong structural/volume-profile levels."
     )
     update.message.reply_markdown(text)
 
@@ -469,17 +461,12 @@ def scanner_job(context: CallbackContext):
     if OWNER_CHAT_ID == 0:
         return
 
-    # If user stopped scanner via /stop, do nothing
     if not SCAN_ENABLED:
         return
 
     try:
         symbols = get_top_symbols()
-    except Exception as e:
-        context.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=f"❌ Scanner: failed to fetch symbols: {e}",
-        )
+    except Exception:
         return
 
     now = datetime.now(timezone.utc)
@@ -502,10 +489,10 @@ def scanner_job(context: CallbackContext):
 
         msg = (
             "🚨 *AI Scanner Signal*\n"
-            f"Pair: *{sig['symbol']}*\n"
+            f"Pair: *{sym}*\n"
             f"Direction: *{sig['direction'].upper()}*\n"
             f"Probability: `{sig['probability']}%`\n"
-            f"RR: `{sig['rr']}` (>= {MIN_RR})\n"
+            f"RR: `{sig['rr']}` (≥ {MIN_RR})\n"
             f"Entry: `{sig['entry']}`\n"
             f"SL (key level): `{sig['sl']}`\n"
             f"TP1: `{sig['tp1']}`\n"
@@ -529,15 +516,13 @@ def main():
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # start/stop control scanner + help
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("help", start))
     dp.add_handler(CommandHandler("stop", stop))
 
-    # catch all /pair commands like /suiusdt, /btcusdt 4h etc.
+    # Catch all /coin commands such as /suiusdt or /btcusdt 4h
     dp.add_handler(MessageHandler(Filters.command, handle_pair))
 
-    # JobQueue is built-in in v13
     jq = updater.job_queue
     jq.run_repeating(scanner_job, interval=SCAN_INTERVAL_SECONDS, first=30)
 
